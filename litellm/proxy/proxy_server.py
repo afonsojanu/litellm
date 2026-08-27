@@ -116,6 +116,10 @@ from litellm.router_utils.add_retry_fallback_headers import (
     get_fallback_errors_from_headers,
     get_hidden_params_dict,
 )
+from litellm.router_utils.auto_router_model_naming import (
+    carries_complexity_router_settings,
+    validate_complexity_router_config_placement,
+)
 from litellm.types.utils import (
     ModelResponse,
     ModelResponseStream,
@@ -4150,6 +4154,25 @@ def validate_deployment_max_agentic_loops(model: Mapping[str, object]) -> None:
     )
 
 
+def validate_deployment_complexity_router_placement(model: Mapping[str, object]) -> None:
+    """
+    Reject a complexity-router setting written one level above `complexity_router_config`.
+
+    Checked here rather than on `LiteLLM_Params` for the same reason as
+    `max_agentic_loops`: the proxy builds its router with
+    `ignore_invalid_deployments=True`, so a rejection further down turns a bad
+    deployment into a silently missing model instead of a refusal to start.
+    """
+    litellm_params: Final = model.get("litellm_params")
+    if not isinstance(litellm_params, Mapping):
+        return
+    if not carries_complexity_router_settings(litellm_params):
+        return
+    violation: Final = validate_complexity_router_config_placement(litellm_params)
+    if violation is not None:
+        raise ValueError(f"model {model.get('model_name', '')!r}: {violation}")
+
+
 def pin_complexity_router_model_id(model: dict) -> None:  # mutable-ok: out-param, model_info is stamped in place
     """
     Stamps `model_info.id` from the raw litellm_params before plugin resolution swaps
@@ -5498,6 +5521,7 @@ class ProxyConfig:
                     if isinstance(v, str) and v.startswith("os.environ/"):
                         model["litellm_params"][k] = get_secret(v)
                 validate_deployment_max_agentic_loops(model)
+                validate_deployment_complexity_router_placement(model)
                 pin_complexity_router_model_id(model)
                 complexity_router_config = model["litellm_params"].get("complexity_router_config")
                 if isinstance(complexity_router_config, dict):

@@ -1,8 +1,10 @@
 import pytest
 
 from litellm.router_utils.auto_router_model_naming import (
+    carries_complexity_router_settings,
     classify_strategy_router_model,
     strategy_router_dependencies,
+    validate_complexity_router_config_placement,
     validate_complexity_router_config_write,
     validate_strategy_router_model_write,
 )
@@ -300,3 +302,68 @@ def test_complexity_embedding_model_is_a_dependency_only_when_semantic_matching_
     )
 
     assert tuple(d.model_name for d in found) == expected
+
+
+@pytest.mark.parametrize(
+    "misplaced",
+    [
+        ("tier_boundaries",),
+        ("token_thresholds", "dimension_weights"),
+        ("reasoning_override_min_score",),
+        ("tiers",),
+    ],
+)
+def test_placement_rejects_settings_written_beside_the_config(misplaced):
+    """A setting one level above complexity_router_config configures nothing and is forwarded to
+    the provider as an unknown body field, so the deployment fails every call with an error naming
+    an internal config key. The whole key set leaks the same way, not just the one first reported."""
+    violation = validate_complexity_router_config_placement(
+        {
+            "model": "auto_router/complexity_router",
+            "complexity_router_config": {"tiers": VALID_TIERS},
+            **{key: {"anything": 1} for key in misplaced},
+        }
+    )
+    assert violation is not None
+    for key in misplaced:
+        assert key in violation
+    assert "Move them under complexity_router_config" in violation
+
+
+def test_placement_accepts_the_documented_nesting():
+    assert (
+        validate_complexity_router_config_placement(
+            {
+                "model": "auto_router/complexity_router",
+                "complexity_router_config": {"tiers": VALID_TIERS, "tier_boundaries": {"simple_medium": 0.1}},
+            }
+        )
+        is None
+    )
+
+
+def test_placement_guards_every_setting_the_config_owns():
+    """Derived from the model rather than listed here, so a field added to ComplexityRouterConfig
+    later is covered without editing this gate. Pinned so a rename cannot silently shrink it."""
+    from litellm.router_strategy.complexity_router.config import (
+        COMPLEXITY_ROUTER_CONFIG_KEYS,
+        ComplexityRouterConfig,
+    )
+
+    assert COMPLEXITY_ROUTER_CONFIG_KEYS == frozenset(ComplexityRouterConfig.model_fields)
+    assert {"tier_boundaries", "token_thresholds", "dimension_weights"} <= COMPLEXITY_ROUTER_CONFIG_KEYS
+
+
+@pytest.mark.parametrize(
+    "litellm_params,scoped",
+    [
+        ({"model": "auto_router/complexity_router"}, True),
+        ({"model": "openai/gpt-4o", "complexity_router_config": {"tiers": VALID_TIERS}}, True),
+        ({"model": "openai/gpt-4o", "embedding_model": "text-embedding-3-small"}, False),
+        ({"model": "auto_router/semantic_router"}, False),
+    ],
+)
+def test_placement_is_scoped_to_complexity_router_deployments(litellm_params, scoped):
+    """The setting names only mean this on a complexity router: `embedding_model` is a legitimate
+    flat param on an s3_vectors vector store, so an unscoped gate would reject a valid deployment."""
+    assert carries_complexity_router_settings(litellm_params) is scoped
